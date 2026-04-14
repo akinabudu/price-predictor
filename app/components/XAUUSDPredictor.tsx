@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ReferenceLine, ResponsiveContainer, Cell, BarChart,
+  ReferenceLine, ResponsiveContainer, Cell,
 } from "recharts";
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -255,6 +255,49 @@ function generateDemoData(pair: Pair): Candle[] {
   return candles;
 }
 
+// ─── VOLUME PROFILE SVG ───────────────────────────────────────────────────────
+// Renders bars at exact Y positions derived from price, so the orientation is
+// always correct: high prices at top, low prices at bottom, VAH green, VAL red.
+function VolumeProfileSVG({
+  profile, priceMin, priceMax, height = 320, width = 120,
+}: {
+  profile: Bucket[];
+  priceMin: number;
+  priceMax: number;
+  height?: number;
+  width?: number;
+}) {
+  if (!profile.length || priceMax === priceMin) return null;
+  const priceRange = priceMax - priceMin;
+  const bucketH = height / profile.length;
+
+  return (
+    <svg width={width} height={height} style={{ display: "block" }}>
+      {profile.map((b, i) => {
+        // y=0 is the top of the SVG → highest price.
+        const yCenter = ((priceMax - b.priceLevel) / priceRange) * height;
+        const barW = Math.max(2, (b.normalizedVol ?? 0) * (width - 2));
+        const fill = b.isPOC ? "#f5c842"
+          : b.isVAH ? "#00e5a0"
+          : b.isVAL ? "#ff4d6d"
+          : "#1e3a5f";
+        return (
+          <rect
+            key={i}
+            x={0}
+            y={Math.max(0, yCenter - bucketH / 2)}
+            width={barW}
+            height={Math.max(1, bucketH - 1)}
+            fill={fill}
+            opacity={b.isPOC ? 1 : 0.78}
+            rx={1}
+          />
+        );
+      })}
+    </svg>
+  );
+}
+
 // ─── SHARED STYLE HELPERS ─────────────────────────────────────────────────────
 const pillBase: React.CSSProperties = {
   fontFamily: "'IBM Plex Mono', monospace",
@@ -377,8 +420,16 @@ export default function Predictor() {
   const displayCandles = candles.slice(-80);
   const fmt = (n: number) => n.toFixed(pair.decimals);
 
-  const priceMin = displayCandles.length ? Math.min(...displayCandles.map(c => c.low)) * 0.9998 : 0;
-  const priceMax = displayCandles.length ? Math.max(...displayCandles.map(c => c.high)) * 1.0002 : 0;
+  // Extend domain to always include the prediction target + range extremes.
+  const predPrices = prediction
+    ? [prediction.target, prediction.rangeLow, prediction.rangeHigh]
+    : [];
+  const priceMin = displayCandles.length
+    ? Math.min(...displayCandles.map(c => c.low), ...predPrices) * 0.9997
+    : 0;
+  const priceMax = displayCandles.length
+    ? Math.max(...displayCandles.map(c => c.high), ...predPrices) * 1.0003
+    : 0;
 
   const chartData = displayCandles.map(c => ({
     ...c,
@@ -674,29 +725,46 @@ export default function Predictor() {
           </div>
 
           {/* VOLUME PROFILE */}
-          <div style={{ flex: 1, background: "#0d1526", border: "1px solid #1e2d4a", borderRadius: 12, padding: "16px", minWidth: 130 }}>
+          <div style={{ flex: 1, background: "#0d1526", border: "1px solid #1e2d4a", borderRadius: 12, padding: "16px", minWidth: 150, display: "flex", flexDirection: "column" }}>
             <div style={{ fontSize: 11, color: "#64748b", letterSpacing: "2px", marginBottom: 12 }}>VOL PROFILE</div>
-            {profile.length > 0 ? (
-              <ResponsiveContainer width="100%" height={320}>
-                <BarChart data={[...profile].reverse()} layout="vertical" margin={{ top: 0, right: 8, bottom: 0, left: 0 }} barCategoryGap={1}>
-                  <XAxis type="number" hide />
-                  <YAxis dataKey="priceLevel" type="number" domain={[priceMin, priceMax]} hide />
-                  <Bar dataKey="normalizedVol" isAnimationActive={false} radius={[0, 2, 2, 0]}>
-                    {[...profile].reverse().map((e, i) => (
-                      <Cell key={i} fill={e.isPOC ? "#f5c842" : e.isVAH ? "#00e5a0" : e.isVAL ? "#ff4d6d" : "#1e3a5f"} opacity={e.isPOC ? 1 : 0.75} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            ) : (
-              <div style={{ height: 320, display: "flex", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: 11 }}>
-                {loading ? "..." : "No data"}
+
+            {/* Price axis labels aligned to chart height */}
+            <div style={{ display: "flex", gap: 8, flex: 1 }}>
+              {/* Y-axis price labels */}
+              <div style={{ display: "flex", flexDirection: "column", justifyContent: "space-between", alignItems: "flex-end", height: 320, flexShrink: 0 }}>
+                {[priceMax, vah, poc, val, priceMin].map((p, i) => (
+                  <span key={i} style={{
+                    fontSize: 8,
+                    color: p === vah ? "#00e5a0" : p === poc ? "#f5c842" : p === val ? "#ff4d6d" : "#334155",
+                    fontWeight: (p === vah || p === poc || p === val) ? 600 : 400,
+                    lineHeight: 1,
+                  }}>
+                    {p ? p.toFixed(pair.decimals <= 3 ? pair.decimals : pair.decimals - 1) : ""}
+                  </span>
+                ))}
               </div>
-            )}
-            <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
-              {[["#f5c842", "POC"], ["#00e5a0", "VAH"], ["#ff4d6d", "VAL"], ["#1e3a5f", "Volume"]].map(([color, label]) => (
+
+              {/* SVG bars — price-accurate positioning */}
+              {profile.length > 0 ? (
+                <VolumeProfileSVG
+                  profile={profile}
+                  priceMin={priceMin}
+                  priceMax={priceMax}
+                  height={320}
+                  width={90}
+                />
+              ) : (
+                <div style={{ height: 320, display: "flex", alignItems: "center", justifyContent: "center", color: "#475569", fontSize: 11 }}>
+                  {loading ? "..." : "No data"}
+                </div>
+              )}
+            </div>
+
+            {/* Legend */}
+            <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 4 }}>
+              {[["#f5c842", "POC — Point of Control"], ["#00e5a0", "VAH — Value Area High"], ["#ff4d6d", "VAL — Value Area Low"], ["#1e3a5f", "Volume node"]].map(([color, label]) => (
                 <div key={label} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 9, color: "#64748b" }}>
-                  <div style={{ width: 10, height: 10, borderRadius: 2, background: color }} />
+                  <div style={{ width: 8, height: 8, borderRadius: 1, background: color, flexShrink: 0 }} />
                   {label}
                 </div>
               ))}
