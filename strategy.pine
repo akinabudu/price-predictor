@@ -1,0 +1,413 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// APEX · Anchored Volume Profile Strategy  (Pine Script v5)
+// ──────────────────────────────────────────────────────────────────────────────
+// Direct port of the Next.js price-predictor app:
+//   • Rolling anchored volume profile  →  POC / VAH / VAL
+//   • Three-case prediction logic      →  Breakout / Breakdown / Inner-VA
+//   • Four prediction horizons         →  30M / 1H / 4H / 1D
+//   • Full strategy scaffold           →  backtestable, tradeable
+//
+// HOW TO USE
+//   1. Open TradingView → Pine Script Editor → paste this file → Add to chart
+//   2. Set the instrument (XAU/USD, EUR/USD, etc.) and a 1-minute or 5-minute
+//      chart so the volume profile has enough bars to work with.
+//   3. Open Strategy Tester to backtest. Tune inputs per your risk tolerance.
+//   4. For live trading: enable alerts on the "Long Entry" / "Short Entry"
+//      conditions and connect to your broker via TradingView's alerts.
+// ══════════════════════════════════════════════════════════════════════════════
+//@version=5
+strategy(
+    title             = "APEX · Volume Profile Strategy",
+    shorttitle        = "APEX-VP",
+    overlay           = true,
+    initial_capital   = 10000,
+    currency          = currency.USD,
+    default_qty_type  = strategy.percent_of_equity,
+    default_qty_value = 10,
+    commission_type   = strategy.commission.percent,
+    commission_value  = 0.02,
+    slippage          = 2,
+    max_bars_back     = 500,
+    calc_on_every_tick = false
+)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── INPUTS ────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+var string G_STRAT   = "── Strategy ──────────────────────"
+var string G_RISK    = "── Risk Management ────────────────"
+var string G_FILTER  = "── Signal Filters ─────────────────"
+var string G_DISPLAY = "── Display ────────────────────────"
+
+// Strategy core
+i_horizon    = input.string ("1H",   "Prediction Horizon",
+     options  = ["30M", "1H", "4H", "1D"],
+     tooltip  = "Mirrors the app's timeframe selector. Scales lookback window, momentum window, and ATR projection multiplier.",
+     group    = G_STRAT)
+
+i_buckets    = input.int    (60,     "VP Buckets",
+     minval   = 20, maxval = 120,
+     tooltip  = "Number of price buckets for the volume profile histogram. More buckets = finer resolution.",
+     group    = G_STRAT)
+
+i_vaPct      = input.float  (0.70,   "Value Area %",
+     minval   = 0.50, maxval = 0.99, step = 0.01,
+     tooltip  = "Fraction of total volume the value area must contain. App default: 70%.",
+     group    = G_STRAT)
+
+// Risk management
+i_useSLTP    = input.bool   (true,   "Use SL / TP",          group = G_RISK)
+i_slMult     = input.float  (1.5,    "Stop Loss  (ATR ×)",
+     minval   = 0.1, step = 0.1,    group = G_RISK)
+i_tpMult     = input.float  (2.5,    "Take Profit (ATR ×)",
+     minval   = 0.1, step = 0.1,    group = G_RISK)
+i_useTrail   = input.bool   (false,  "Trailing Stop",         group = G_RISK)
+i_trailMult  = input.float  (1.0,    "Trail Offset (ATR ×)",
+     minval   = 0.1, step = 0.1,    group = G_RISK)
+
+// Signal filters
+i_minMomentum = input.int   (3,      "Min Momentum Candles",
+     minval   = 1, maxval = 10,
+     tooltip  = "Minimum number of bull/bear candles in the momentum window to confirm a signal.",
+     group    = G_FILTER)
+i_vahFilter   = input.bool  (true,   "Breakout: require close above VAH (not just touch)",
+     group    = G_FILTER)
+i_valFilter   = input.bool  (true,   "Breakdown: require close below VAL (not just touch)",
+     group    = G_FILTER)
+i_noReEntry   = input.bool  (true,   "Block re-entry in same direction until level is recrossed",
+     group    = G_FILTER)
+
+// Display
+i_showVABox  = input.bool   (true,   "Show Value Area Box",   group = G_DISPLAY)
+i_showPOC    = input.bool   (true,   "Show POC line",         group = G_DISPLAY)
+i_showVAH    = input.bool   (true,   "Show VAH line",         group = G_DISPLAY)
+i_showVAL    = input.bool   (true,   "Show VAL line",         group = G_DISPLAY)
+i_showTarget = input.bool   (true,   "Show Target line",      group = G_DISPLAY)
+i_showLabels = input.bool   (true,   "Show entry labels",     group = G_DISPLAY)
+i_showTable  = input.bool   (true,   "Show info table",       group = G_DISPLAY)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── TIMEFRAME PARAMETERS  (exact mirror of app's TIMEFRAMES config) ───────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  Horizon │ lookback │ momentum │ atrMult │ display
+//  30M     │ 30       │ 10       │ 2.0     │ "30-MINUTE"
+//  1H      │ 60       │ 20       │ 3.0     │ "1-HOUR"
+//  4H      │ 240      │ 60       │ 5.0     │ "4-HOUR"
+//  1D      │ 390      │ 90       │ 8.0     │ "DAILY"
+
+int   lookbackN = i_horizon == "30M" ? 30  : i_horizon == "1H" ? 60  : i_horizon == "4H" ? 240 : 390
+int   momentumN = i_horizon == "30M" ? 10  : i_horizon == "1H" ? 20  : i_horizon == "4H" ? 60  : 90
+float atrMult   = i_horizon == "30M" ? 2.0 : i_horizon == "1H" ? 3.0 : i_horizon == "4H" ? 5.0 : 8.0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── VOLUME PROFILE  (rolling window, rebuilt on every bar) ───────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// Algorithm (mirrors buildVolumeProfile in the app):
+//   1. Find rolling high / low over lookbackN bars → defines bucket boundaries.
+//   2. For each candle in the window, distribute its volume across the buckets
+//      that span its high-low range (volume / rangeTicks per bucket).
+//   3. POC = bucket with maximum volume.
+//   4. Expand outward from POC until i_vaPct of total volume is captured
+//      → VAH = top of the highest captured bucket
+//      → VAL = bottom of the lowest captured bucket.
+
+float pHigh  = ta.highest(high,   lookbackN)
+float pLow   = ta.lowest (low,    lookbackN)
+float bSize  = (pHigh - pLow) / i_buckets
+
+// Allocate bucket array and fill it this bar.
+float[] volArr = array.new_float(i_buckets, 0.0)
+
+for i = 0 to lookbackN - 1
+    float cH  = high[i]
+    float cL  = low[i]
+    float cV  = math.max(volume[i], 1.0)   // treat 0-volume bars as 1 to avoid ÷0
+    // Number of ticks the candle spans across the bucket grid.
+    int   nTk = math.max(1, int(math.round((cH - cL) / bSize)))
+    float step = (cH - cL) / nTk
+    for j = 0 to nTk
+        float p   = cL + j * step
+        int   idx = math.min(int(math.floor((p - pLow) / bSize)), i_buckets - 1)
+        if idx >= 0
+            array.set(volArr, idx, array.get(volArr, idx) + cV / (nTk + 1))
+
+// ── POC ───────────────────────────────────────────────────────────────────────
+float maxVol = array.max(volArr)
+int   pocIdx = array.indexof(volArr, maxVol)
+float poc    = pLow + (pocIdx + 0.5) * bSize
+
+// ── VAH / VAL (expand from POC) ───────────────────────────────────────────────
+float totalVol = array.sum(volArr)
+float captured = array.get(volArr, pocIdx)
+int   loIdx    = pocIdx
+int   hiIdx    = pocIdx
+int   guard    = 0                          // safety counter (Pine while limit)
+
+while captured / totalVol < i_vaPct and guard < i_buckets
+    float addLo = loIdx > 0            ? array.get(volArr, loIdx - 1) : 0.0
+    float addHi = hiIdx < i_buckets - 1 ? array.get(volArr, hiIdx + 1) : 0.0
+    if addLo == 0.0 and addHi == 0.0
+        break
+    if addHi >= addLo
+        hiIdx    += 1
+        captured += addHi
+    else
+        loIdx    -= 1
+        captured += addLo
+    guard += 1
+
+float vah = pLow + (hiIdx + 1) * bSize     // top  edge of the highest bucket
+float val = pLow + loIdx       * bSize     // bottom edge of the lowest bucket
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── ATR ───────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+float atr = ta.atr(lookbackN)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── MOMENTUM  (mirrors momentumCandles logic in buildPrediction) ──────────────
+// ══════════════════════════════════════════════════════════════════════════════
+int upCount   = 0
+int downCount = 0
+for i = 0 to momentumN - 1
+    if close[i] > open[i]
+        upCount   += 1
+    else
+        downCount += 1
+
+// Normalised momentum score [0,1]
+float momentumScore = float(upCount) / float(momentumN)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── SIGNAL LOGIC  (mirror of buildPrediction three-case switch) ───────────────
+// ══════════════════════════════════════════════════════════════════════════════
+float vaWidth     = math.max(vah - val, 1e-10)
+float distFromVAH = close - vah
+float distFromVAL = val  - close
+
+// ── Case 1: Bullish BREAKOUT above VAH ───────────────────────────────────────
+float bullStrength = distFromVAH / vaWidth
+float bullProj     = atr * atrMult * (1.0 + bullStrength * 0.5)
+float bullTarget   = close + bullProj
+float bullRangeLo  = close + bullProj * 0.5
+float bullRangeHi  = close + bullProj * 1.8
+int   bullConf     = math.min(95, int(55 + bullStrength * 25 + momentumScore * 15))
+
+bool  aboveVAH     = i_vahFilter ? close > vah : high > vah
+bool  bullBreak    = aboveVAH and upCount >= i_minMomentum
+
+// ── Case 2: Bearish BREAKDOWN below VAL ──────────────────────────────────────
+float bearStrength = distFromVAL / vaWidth
+float bearProj     = atr * atrMult * (1.0 + bearStrength * 0.5)
+float bearTarget   = close - bearProj
+float bearRangeLo  = close - bearProj * 1.8
+float bearRangeHi  = close - bearProj * 0.5
+int   bearConf     = math.min(95, int(55 + bearStrength * 25 + (1.0 - momentumScore) * 15))
+
+bool  belowVAL     = i_valFilter ? close < val : low < val
+bool  bearBreak    = belowVAL and downCount >= i_minMomentum
+
+// ── Case 3: Inside Value Area ─────────────────────────────────────────────────
+bool  inVA         = close >= val and close <= vah
+int   momentumThr  = math.max(3, int(momentumN * 0.5))
+
+bool  innerBull    = inVA and upCount   >= momentumThr
+bool  innerBear    = inVA and downCount >= momentumThr
+
+float innerBullTarget = vah + atr * atrMult * 0.5
+float innerBearTarget = val - atr * atrMult * 0.5
+int   innerBullConf   = int(40 + momentumScore * 20)
+int   innerBearConf   = int(40 + (1.0 - momentumScore) * 20)
+
+// ── Final combined signal ─────────────────────────────────────────────────────
+bool  longSignal   = bullBreak or innerBull
+bool  shortSignal  = bearBreak or innerBear
+
+// Active target and confidence for display
+float activeTarget = longSignal  ? (bullBreak ? bullTarget : innerBullTarget)
+     : shortSignal ? (bearBreak  ? bearTarget : innerBearTarget)
+     : na
+int   activeConf   = longSignal  ? (bullBreak ? bullConf  : innerBullConf)
+     : shortSignal ? (bearBreak  ? bearConf   : innerBearConf)
+     : 0
+
+// ── Transition filter: only enter on the first bar of a new signal ────────────
+bool longEntry  = longSignal  and not longSignal[1]
+bool shortEntry = shortSignal and not shortSignal[1]
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── STRATEGY ORDERS ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// SL and TP are computed at entry-bar price so they reflect the actual
+// risk at the moment of the signal.
+float longSL  = close - atr * i_slMult
+float longTP  = bullBreak ? bullTarget : innerBullTarget
+float shortSL = close + atr * i_slMult
+float shortTP = bearBreak ? bearTarget : innerBearTarget
+
+// Long entry
+if longEntry and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long, comment = "▲ " + i_horizon)
+    if i_useSLTP
+        if i_useTrail
+            strategy.exit("Long X", "Long",
+                 trail_price  = longTP,
+                 trail_offset = atr * i_trailMult / syminfo.mintick)
+        else
+            strategy.exit("Long X", "Long",
+                 stop  = longSL,
+                 limit = longTP)
+
+// Short entry
+if shortEntry and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short, comment = "▼ " + i_horizon)
+    if i_useSLTP
+        if i_useTrail
+            strategy.exit("Short X", "Short",
+                 trail_price  = shortTP,
+                 trail_offset = atr * i_trailMult / syminfo.mintick)
+        else
+            strategy.exit("Short X", "Short",
+                 stop  = shortSL,
+                 limit = shortTP)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── DISPLAY ───────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Value Area box ────────────────────────────────────────────────────────────
+var box vaBox = na
+if i_showVABox
+    box.delete(vaBox[1])
+    vaBox := box.new(
+         left         = bar_index - lookbackN,
+         top          = vah,
+         right        = bar_index,
+         bottom       = val,
+         border_color = color.new(color.blue, 65),
+         border_width = 1,
+         bgcolor      = color.new(color.blue, 92))
+
+// ── POC / VAH / VAL lines ─────────────────────────────────────────────────────
+plot(i_showPOC ? poc : na, "POC",
+     color = color.new(color.yellow, 0), linewidth = 2,
+     style = plot.style_stepline_diamond)
+
+plot(i_showVAH ? vah : na, "VAH",
+     color = color.new(color.green, 20), linewidth = 1,
+     style = plot.style_stepline)
+
+plot(i_showVAL ? val : na, "VAL",
+     color = color.new(color.red, 20), linewidth = 1,
+     style = plot.style_stepline)
+
+// ── Target line ───────────────────────────────────────────────────────────────
+plot(i_showTarget and not na(activeTarget) ? activeTarget : na, "Target",
+     color = color.new(color.purple, 30), linewidth = 1,
+     style = plot.style_circles)
+
+// ── Stop lines (visualise SL at entry) ───────────────────────────────────────
+plot(longEntry  and i_useSLTP ? longSL  : na, "Long SL",
+     color = color.new(color.red, 50), linewidth = 1, style = plot.style_cross)
+plot(shortEntry and i_useSLTP ? shortSL : na, "Short SL",
+     color = color.new(color.red, 50), linewidth = 1, style = plot.style_cross)
+
+// ── Entry / exit arrows (built-in strategy plots) ────────────────────────────
+plotshape(i_showLabels and longEntry,  "Long Entry",
+     style   = shape.labelup,
+     location = location.belowbar,
+     color   = color.new(color.green, 10),
+     textcolor = color.white,
+     text    = "▲ LONG\n" + i_horizon,
+     size    = size.small)
+
+plotshape(i_showLabels and shortEntry, "Short Entry",
+     style   = shape.labeldown,
+     location = location.abovebar,
+     color   = color.new(color.red, 10),
+     textcolor = color.white,
+     text    = "▼ SHORT\n" + i_horizon,
+     size    = size.small)
+
+// ── Background tint: active signal zone ──────────────────────────────────────
+bgcolor(bullBreak ? color.new(color.green, 96)
+     : bearBreak  ? color.new(color.red,   96)
+     : inVA       ? color.new(color.blue,  98)
+     : na,
+     title = "Signal Zone")
+
+// ── Info table (top-right corner) ────────────────────────────────────────────
+if i_showTable and barstate.islast
+    var table t = table.new(position.top_right, 2, 9,
+         bgcolor      = color.new(color.black, 70),
+         border_color = color.new(color.gray,  60),
+         border_width = 1,
+         frame_color  = color.new(color.gray,  50),
+         frame_width  = 1)
+
+    // Helper to write a row
+    labelCell(row, txt) =>
+        table.cell(t, 0, row, txt,
+             text_color = color.new(color.gray, 20),
+             text_size  = size.small,
+             bgcolor     = color.new(color.black, 60))
+
+    valueCell(row, txt, clr) =>
+        table.cell(t, 1, row, txt,
+             text_color = clr,
+             text_size  = size.small,
+             bgcolor     = color.new(color.black, 60))
+
+    labelCell(0, "APEX · " + i_horizon)
+    valueCell(0, syminfo.ticker, color.new(color.yellow, 0))
+
+    labelCell(1, "POC")
+    valueCell(1, str.tostring(poc, format.mintick), color.yellow)
+
+    labelCell(2, "VAH")
+    valueCell(2, str.tostring(vah, format.mintick), color.green)
+
+    labelCell(3, "VAL")
+    valueCell(3, str.tostring(val, format.mintick), color.red)
+
+    labelCell(4, "VA Width")
+    valueCell(4, str.tostring(vaWidth, format.mintick), color.new(color.purple, 20))
+
+    labelCell(5, "ATR")
+    valueCell(5, str.tostring(atr, format.mintick), color.new(color.gray, 10))
+
+    labelCell(6, "Momentum ↑/↓")
+    valueCell(6, str.tostring(upCount) + " / " + str.tostring(downCount),
+         upCount > downCount ? color.green : color.red)
+
+    string sigTxt = longSignal ? (bullBreak ? "BREAKOUT ▲" : "INNER BULL ▲")
+         : shortSignal         ? (bearBreak ? "BREAKDOWN ▼" : "INNER BEAR ▼")
+         : "NEUTRAL"
+    color  sigClr = longSignal ? color.new(color.green, 10)
+         : shortSignal         ? color.new(color.red,   10)
+         : color.new(color.gray, 30)
+
+    labelCell(7, "Signal")
+    valueCell(7, sigTxt, sigClr)
+
+    labelCell(8, "Confidence")
+    valueCell(8, str.tostring(activeConf) + "%",
+         activeConf >= 70 ? color.green : activeConf >= 50 ? color.yellow : color.red)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ── ALERTS ────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+alertcondition(longEntry,  "APEX Long Entry",
+     message = "APEX-VP ▲ LONG {{ticker}} @ {{close}} | Target: " +
+               str.tostring(longTP, format.mintick) +
+               " | SL: " + str.tostring(longSL, format.mintick) +
+               " | Conf: " + str.tostring(activeConf) + "%")
+
+alertcondition(shortEntry, "APEX Short Entry",
+     message = "APEX-VP ▼ SHORT {{ticker}} @ {{close}} | Target: " +
+               str.tostring(shortTP, format.mintick) +
+               " | SL: " + str.tostring(shortSL, format.mintick) +
+               " | Conf: " + str.tostring(activeConf) + "%")
+
+alertcondition(longEntry or shortEntry, "APEX Any Entry",
+     message = "APEX-VP signal on {{ticker}} @ {{close}}")
