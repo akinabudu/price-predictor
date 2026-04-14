@@ -268,10 +268,21 @@ const pillBase: React.CSSProperties = {
   transition: "background 0.15s, border-color 0.15s, color 0.15s",
 };
 
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+/** Convert "HH:MM" to a unix timestamp using today's date. */
+function anchorToTimestamp(hhmm: string): number {
+  const [h, m] = hhmm.split(":").map(Number);
+  const d = new Date();
+  d.setHours(h, m, 0, 0);
+  return d.getTime() / 1000;
+}
+
 // ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
 export default function Predictor() {
   const [pairIdx, setPairIdx] = useState(0);
   const [tfIdx, setTfIdx] = useState(0);
+  const [anchorTime, setAnchorTime] = useState("00:00");
+  const [anchorInput, setAnchorInput] = useState("00:00"); // controlled input value
   const [candles, setCandles] = useState<Candle[]>([]);
   const [profile, setProfile] = useState<Bucket[]>([]);
   const [poc, setPoc] = useState(0);
@@ -291,6 +302,7 @@ export default function Predictor() {
   const pair = PAIRS[pairIdx];
   const tf = TIMEFRAMES[tfIdx];
 
+  // ── Fetch raw candles (no profile logic here) ──────────────────────────────
   const loadData = useCallback(async () => {
     const currentPair = PAIRS[pairIdx];
     setLoading(true);
@@ -317,13 +329,7 @@ export default function Predictor() {
           setDataSource("demo");
         }
       }
-
       setCandles(data);
-      const { profile: vp, poc: p, vah: vh, val: vl } = buildVolumeProfile(data);
-      setProfile(vp);
-      setPoc(p); setVah(vh); setVal(vl);
-      const curr = data[data.length - 1]?.close || p;
-      setPrediction(buildPrediction(data, p, vh, vl, curr, TIMEFRAMES[tfIdx], currentPair.decimals));
       setLastUpdate(new Date());
       setNextRefresh(60);
     } catch (e) {
@@ -334,15 +340,20 @@ export default function Predictor() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pairIdx]);
 
-  // Re-run prediction (no fetch) whenever timeframe changes.
+  // ── Recompute profile + prediction whenever candles, anchor, or tf change ──
   useEffect(() => {
-    if (!candles.length || !poc) return;
-    const curr = candles[candles.length - 1]?.close || poc;
-    setPrediction(buildPrediction(candles, poc, vah, val, curr, tf, pair.decimals));
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tfIdx]);
+    if (!candles.length) return;
+    const cutoff = anchorToTimestamp(anchorTime);
+    const anchored = candles.filter(c => c.timestamp >= cutoff);
+    if (!anchored.length) return;
+    const { profile: vp, poc: p, vah: vh, val: vl } = buildVolumeProfile(anchored);
+    setProfile(vp);
+    setPoc(p); setVah(vh); setVal(vl);
+    const curr = anchored[anchored.length - 1]?.close || p;
+    setPrediction(buildPrediction(anchored, p, vh, vl, curr, TIMEFRAMES[tfIdx], PAIRS[pairIdx].decimals));
+  }, [candles, anchorTime, tfIdx, pairIdx]);
 
-  // Fetch when pair changes.
+  // ── Reset data + fetch when pair changes ───────────────────────────────────
   useEffect(() => {
     setCandles([]); setProfile([]); setPoc(0); setVah(0); setVal(0); setPrediction(null);
     loadData();
@@ -374,6 +385,12 @@ export default function Predictor() {
     priceRange: [c.low, c.high],
     bodyRange: [Math.min(c.open, c.close), Math.max(c.open, c.close)],
   }));
+
+  // Find the candle in displayCandles closest to the anchor timestamp,
+  // used to draw a vertical reference line on the chart.
+  const anchorTs = anchorToTimestamp(anchorTime);
+  const anchorCandle = displayCandles.find(c => c.timestamp >= anchorTs);
+  const anchorXValue = anchorCandle?.time ?? null;
 
   // Tick formatter — show fewer decimals on the Y-axis to save space.
   const tickDecimals = pair.decimals <= 3 ? pair.decimals : pair.decimals - 1;
@@ -498,6 +515,57 @@ export default function Predictor() {
               ))}
             </div>
           </div>
+
+          {/* Divider */}
+          <div style={{ width: 1, height: 40, background: "#1e2d4a", flexShrink: 0 }} />
+
+          {/* Anchor time */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ fontSize: 9, color: "#475569", letterSpacing: "2px" }}>ANCHOR TIME (LOCAL)</div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input
+                type="time"
+                value={anchorInput}
+                onChange={e => setAnchorInput(e.target.value)}
+                onBlur={() => setAnchorTime(anchorInput)}
+                onKeyDown={e => { if (e.key === "Enter") setAnchorTime(anchorInput); }}
+                style={{
+                  background: "#0d1526",
+                  border: `1px solid ${anchorTime !== "00:00" ? "#f5c842" : "#1e2d4a"}`,
+                  borderRadius: 6,
+                  color: anchorTime !== "00:00" ? "#f5c842" : "#94a3b8",
+                  fontFamily: "'IBM Plex Mono', monospace",
+                  fontSize: 12,
+                  fontWeight: 600,
+                  padding: "5px 10px",
+                  cursor: "pointer",
+                  outline: "none",
+                  letterSpacing: "1px",
+                  colorScheme: "dark",
+                }}
+              />
+              {anchorTime !== "00:00" && (
+                <button
+                  onClick={() => { setAnchorTime("00:00"); setAnchorInput("00:00"); }}
+                  title="Reset to session open"
+                  style={{
+                    ...pillBase,
+                    background: "#1e2d4a",
+                    color: "#64748b",
+                    padding: "5px 8px",
+                    fontSize: 12,
+                  }}
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+            <div style={{ fontSize: 9, color: "#334155" }}>
+              {anchorTime !== "00:00"
+                ? `Profile anchored from ${anchorTime} · ${candles.filter(c => c.timestamp >= anchorTs).length} candles`
+                : "Session open (00:00)"}
+            </div>
+          </div>
         </div>
 
         {/* ── KEY LEVELS ── */}
@@ -531,7 +599,10 @@ export default function Predictor() {
           {/* PRICE CHART */}
           <div style={{ flex: 3, background: "#0d1526", border: "1px solid #1e2d4a", borderRadius: 12, padding: "16px" }}>
             <div style={{ fontSize: 11, color: "#64748b", letterSpacing: "2px", marginBottom: 12 }}>
-              {pair.label} · 1M · ANCHORED FROM 00:00
+              {pair.label} · 1M · ANCHORED FROM {anchorTime.toUpperCase()}
+              {anchorTime !== "00:00" && (
+                <span style={{ color: "#f5c842", marginLeft: 8 }}>⚓</span>
+              )}
             </div>
             {displayCandles.length > 0 ? (
               <ResponsiveContainer width="100%" height={320}>
@@ -587,6 +658,11 @@ export default function Predictor() {
                   {prediction?.target && prediction.target > 0 && (
                     <ReferenceLine y={prediction.target} stroke="#a78bfa" strokeDasharray="4 4" strokeWidth={1}
                       label={{ value: `TARGET ${fmt(prediction.target)}`, fill: "#a78bfa", fontSize: 9, position: "insideRight" }} />
+                  )}
+                  {/* Vertical anchor line */}
+                  {anchorXValue && anchorTime !== "00:00" && (
+                    <ReferenceLine x={anchorXValue} stroke="#f5c842" strokeDasharray="3 3" strokeWidth={1.5}
+                      label={{ value: `⚓ ${anchorTime}`, fill: "#f5c842", fontSize: 9, position: "insideTopRight" }} />
                   )}
                 </ComposedChart>
               </ResponsiveContainer>
